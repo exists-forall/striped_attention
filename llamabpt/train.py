@@ -1,5 +1,8 @@
 import pprint
 from functools import partial
+import time
+import json
+import os
 
 from tqdm import tqdm, trange
 import numpy as np
@@ -23,6 +26,7 @@ from tux import (
     OptimizerFactory, StreamingCheckpointer
 )
 from llamabpt.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
+from bpt import permute_tokens
 
 
 FLAGS, FLAGS_DEF = define_flags_with_default(
@@ -136,10 +140,21 @@ def main(argv):
         def loss_and_accuracy(params):
             logits = model.apply(
                 params, batch['input_tokens'], deterministic=False,
+                allow_permuted_outputs=True,
                 rngs=rng_generator(llama_config.rng_keys()),
             ).logits
+            target_tokens = permute_tokens(
+                model.config.attention_type,
+                batch['target_tokens'],
+                model.config.get_mesh_dim_sizes()[-1],
+            )
+            loss_masks = permute_tokens(
+                model.config.attention_type,
+                batch['loss_masks'],
+                model.config.get_mesh_dim_sizes()[-1],
+            )
             return cross_entropy_loss_and_accuracy(
-                logits, batch['target_tokens'], batch['loss_masks']
+                logits, target_tokens, loss_masks
             )
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
         (loss, accuracy), grads = grad_fn(train_state.params)
@@ -259,10 +274,19 @@ def main(argv):
 
         step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
 
+        times = []
+
+        prev_time = time.time()
         for step, (batch, dataset_metrics) in zip(step_counter, dataset):
             train_state, sharded_rng, metrics = sharded_train_step(
                 train_state, sharded_rng, batch
             )
+            metrics["loss"].block_until_ready()
+            curr_time = time.time()
+            interval = curr_time - prev_time
+            prev_time = curr_time
+            print("\n############ step: {:>4} ; time: {:8.03f}".format(step, interval))
+            times.append(interval)
 
             if step % FLAGS.log_freq == 0:
                 if FLAGS.eval_steps > 0:
@@ -290,6 +314,12 @@ def main(argv):
 
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
+
+        env_var_out_path = "BENCHMARK_OUT_PATH"
+        if env_var_out_path in os.environ:
+            out_path = os.environ[env_var_out_path]
+            with open(out_path, "w") as out_file:
+                json.dump({"times": times}, out_file)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ from transformers.utils import add_start_docstrings, add_start_docstrings_to_mod
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
 from tux import function_args_to_config, load_pickle, open_file,  with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
-from bpt import blockwise_ffn, blockwise_attn, ring_attention
+from bpt import blockwise_ffn, blockwise_attn, ring_attention, permute_tokens, unpermute_outputs
 
 
 LLAMA_STANDARD_CONFIGS = {
@@ -230,6 +230,9 @@ class LLaMAConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def get_mesh_dim_sizes(self):
+        return [int(size) for size in self.mesh_dim.split(",")]
 
     @classmethod
     def get_default_config(cls, updates=None):
@@ -542,7 +545,7 @@ class FlaxLLaMAAttention(nn.Module):
             dropout_rng = self.make_rng("dropout")
 
         # if self.config.scan_attention and not (self.has_variable("cache", "cached_key") or init_cache):
-        if self.config.attention_type in ['ring_blockwise', 'blockwise']:
+        if self.config.attention_type in ['ring_blockwise', 'blockwise', 'striped']:
             # doesn't need blockwise attention if we are doing autoregressive decoding since no quadratic memory
 
             # attention mask without nxn materlization, blockwise_attn will handle the rest
@@ -558,7 +561,12 @@ class FlaxLLaMAAttention(nn.Module):
             )
             attn_weights = None
 
-            if self.config.attention_type == 'ring_blockwise':
+            if self.config.attention_type in ['ring_blockwise', 'striped']:
+                causal_layout = "striped" if self.config.attention_type == "striped" else "normal"
+                seq_length = hidden_states.shape[1]
+                num_devices = self.config.get_mesh_dim_sizes()[-1]
+                assert seq_length % num_devices == 0
+                block_size = seq_length // num_devices
                 ring_attention_sharded = shard_map(
                     partial(
                         ring_attention,
@@ -568,14 +576,15 @@ class FlaxLLaMAAttention(nn.Module):
                             deterministic=deterministic,
                             dropout_rng=dropout_rng,
                             attn_pdrop=self.config.attn_pdrop,
-                            causal=True,
+                            causal_layout=causal_layout,
                             query_chunk_size=self.config.scan_query_chunk_size,
                             key_chunk_size=self.config.scan_key_chunk_size,
+                            block_size=block_size,
                             dtype=self.dtype,
                             policy=get_gradient_checkpoint_policy('nothing_saveable'),
                             precision=self.precision,
                             prevent_cse=not self.config.scan_layers,
-                        )
+                        ),
                     ),
                     mesh=LLaMAConfig.get_jax_mesh(self.config.mesh_dim),
                     in_specs=(
@@ -1077,7 +1086,14 @@ class FlaxLLaMAModule(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        allow_permuted_outputs: bool = False,
     ):
+        seq_mesh_dim = self.config.get_mesh_dim_sizes()[-1]
+
+        input_ids = permute_tokens(self.config.attention_type, input_ids, seq_mesh_dim)
+        position_ids = permute_tokens(self.config.attention_type, position_ids, seq_mesh_dim)
+        attention_mask = permute_tokens(self.config.attention_type, attention_mask, seq_mesh_dim)
+
         input_embeds = self.wte(input_ids.astype("i4"))
 
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
@@ -1095,6 +1111,9 @@ class FlaxLLaMAModule(nn.Module):
 
         hidden_states = outputs[0]
         hidden_states = self.ln_f(hidden_states)
+
+        if not allow_permuted_outputs:
+            hidden_states = unpermute_outputs(self.config.attention_type, hidden_states, seq_mesh_dim)
 
         if output_hidden_states:
             all_hidden_states = outputs[1] + (hidden_states,)
@@ -1150,6 +1169,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        allow_permuted_outputs: bool = False,
     ):
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
@@ -1168,6 +1188,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            allow_permuted_outputs=allow_permuted_outputs,
         )
 
         hidden_states = outputs[0]

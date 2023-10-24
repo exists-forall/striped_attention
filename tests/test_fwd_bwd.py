@@ -1,3 +1,4 @@
+import os
 import copy
 from absl.app import run
 import tux
@@ -89,7 +90,14 @@ def main(argv):
         llama_config.update(dict(vocab_size=dataset.vocab_size))
     llama_config.update(dict(mesh_dim=FLAGS.mesh_dim))
 
-    attention_types = ['standard', 'ring_standard', 'ring_blockwise', 'blockwise', 'blockwise_custom']
+    attention_types_env_var = "TEST_ATTENTION_TYPES"
+    if attention_types_env_var in os.environ:
+        attention_types = os.environ[attention_types_env_var].split(",")
+    else:
+        attention_types = ['standard', 'ring_standard', 'ring_blockwise', 'blockwise', 'blockwise_custom', 'striped']
+
+    print("Testing attention types:", attention_types)
+
     models = []
     for attention_type in attention_types:
         llama_config_copy = copy.deepcopy(llama_config)
@@ -132,7 +140,8 @@ def main(argv):
         train_state = sharded_init_fn(next_rng())
         batch, _ = next(iter(dataset))
         all_logits, all_grads = [], []
-        for model in models:
+        for attention_type, model in zip(attention_types, models):
+            print("Testing attention type:", attention_type)
             def train_step(train_state, rng, batch):
                 rng_generator = JaxRNG(rng)
                 batch = with_sharding_constraint(batch, PS(('dp', 'fsdp'), 'sp'))
